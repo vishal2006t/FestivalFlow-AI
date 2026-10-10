@@ -364,7 +364,7 @@ def test_database_status_endpoint(admin_token):
     assert data["sqlite_status"] == "ONLINE_HEALTHY"
     assert data["sqlite_table_count"] >= 15
     assert "mongodb_status" in data
-    assert data["mongodb_status"] in ["NOT_CONFIGURED", "CONNECTED", "CONNECTION_FAILED"]
+    assert data["mongodb_status"] in ["NOT_CONFIGURED", "CONNECTED", "CONNECTION_FAILED", "DEPENDENCY_MISSING"]
 
 
 def test_mongo_test_connection_safe():

@@ -11,9 +11,10 @@ Includes:
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta
 import time
+import logging
 from collections import defaultdict
 from urllib.parse import urlparse
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 
 from app.data.sample_scenario import get_default_scenario
 from app.demand_prediction.baseline import RuleBasedDemandPredictor
@@ -72,8 +73,21 @@ from app.database import (
     get_dispatch_plans,
     get_dispatch_plan_by_id,
     approve_dispatch_plan,
-    reject_dispatch_plan
+    reject_dispatch_plan,
+    get_system_settings,
+    update_system_setting,
+    get_emergency_contacts,
+    create_emergency_contact,
+    get_safety_incidents,
+    get_safety_incident_by_id,
+    create_safety_incident,
+    update_safety_incident_status,
+    create_police_escalation,
+    get_police_escalations,
+    update_police_escalation_status
 )
+from app.smart_allocation.allocation_service import smart_allocation_engine
+from app.operations_report.docx_generator import generate_overall_docx_report
 from fastapi.responses import StreamingResponse
 import asyncio
 import json
@@ -154,6 +168,7 @@ from app.database_mongo import (
 from app.weather.weather_service import WeatherService
 
 weather_service = WeatherService()
+logger = logging.getLogger("festivalflow.routes")
 
 # In-memory sliding window rate limiter for login
 _LOGIN_ATTEMPTS: Dict[str, List[float]] = defaultdict(list)
@@ -1961,9 +1976,302 @@ def get_live_tracking_positions(
 @router.post("/api/tracking/advance-step")
 def advance_tracking_step_endpoint(
     user: Dict[str, Any] = Depends(require_admin)
-) -> Dict[str, Any]:
+):
     """Controlled advance of simulated GPS progression along route corridors."""
     return get_simulated_fleet_positions(advance_step=True)
+
+
+# ==================== Smart Allocation Endpoints ====================
+
+@router.get("/api/smart-allocation/recommendations")
+def get_smart_allocation_recommendations(
+    window: str = Query("all", pattern="^(all|day|night)$"),
+    user: Dict[str, Any] = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """Calculate multi-input smart bus allocation recommendations (Weather + Event Timings)."""
+    return smart_allocation_engine.generate_smart_allocations(target_window=window)
+
+
+@router.post("/api/smart-allocation/approve")
+def approve_smart_allocation_plan_endpoint(
+    payload: Dict[str, Any],
+    user: Dict[str, Any] = Depends(require_admin)
+) -> Dict[str, Any]:
+    """Depot Admin ratifies and dispatches a smart bus allocation plan."""
+    plan_id = payload.get("plan_id")
+    target_stop_id = payload.get("target_stop_id", "STOP_MAIN")
+    buses = payload.get("buses", ["BUS-201", "BUS-202", "BUS-203", "BUS-204"])
+    window = payload.get("window", "night")
+
+    return smart_allocation_engine.approve_allocation_plan(
+        plan_id=plan_id,
+        target_stop_id=target_stop_id,
+        buses_to_allocate=buses,
+        admin_username=user["username"],
+        operation_window=window
+    )
+
+
+@router.post("/api/smart-allocation/reject")
+def reject_smart_allocation_plan_endpoint(
+    payload: Dict[str, Any],
+    user: Dict[str, Any] = Depends(require_admin)
+) -> Dict[str, Any]:
+    """Depot Admin declines or rejects a proposed bus redistribution plan."""
+    plan_id = payload.get("plan_id")
+    reason = payload.get("reason", "Declined by Depot Operations Admin.")
+
+    return smart_allocation_engine.reject_allocation_plan(
+        plan_id=plan_id,
+        admin_username=user["username"],
+        reason=reason
+    )
+
+
+# ==================== Day vs Night Operations Endpoints ====================
+
+@router.get("/api/operations/day")
+def get_day_operations_summary(
+    user: Dict[str, Any] = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """Retrieve daytime operations dashboard dataset (06:00 to configured night start)."""
+    allocations = smart_allocation_engine.generate_smart_allocations(target_window="day")
+    settings = get_system_settings()
+
+    return {
+        "operational_window": "day",
+        "label": f"Daytime Transit Operations (06:00 - {int(settings.get('night_start_hour', 20)):02d}:00)",
+        "weather": allocations["weather_context"],
+        "event": allocations["event_context"],
+        "stop_allocations": allocations["stop_allocations"],
+        "summary_metrics": allocations["summary_metrics"],
+        "data_provenance": allocations["data_provenance"]
+    }
+
+
+@router.get("/api/operations/night")
+def get_night_operations_summary(
+    user: Dict[str, Any] = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """Retrieve dedicated night operations console dataset (configurable night window)."""
+    allocations = smart_allocation_engine.generate_smart_allocations(target_window="night")
+    settings = get_system_settings()
+    incidents = get_safety_incidents()
+    escalations = get_police_escalations()
+
+    # Active safety alerts for night
+    active_incidents = [i for i in incidents if i.get("status") in ["NEW", "ACKNOWLEDGED", "ESCALATED"]]
+
+    return {
+        "operational_window": "night",
+        "label": f"Night Egress Transit & Safety Operations ({int(settings.get('night_start_hour', 20)):02d}:00 - {int(settings.get('night_end_hour', 5)):02d}:00)",
+        "settings": settings,
+        "weather": allocations["weather_context"],
+        "event": allocations["event_context"],
+        "primary_recommendation": allocations["primary_recommendation"],
+        "stop_allocations": allocations["stop_allocations"],
+        "summary_metrics": allocations["summary_metrics"],
+        "active_incidents_count": len(active_incidents),
+        "recent_incidents": active_incidents[:5],
+        "escalations_count": len(escalations),
+        "data_provenance": allocations["data_provenance"]
+    }
+
+
+@router.get("/api/operations/night-settings")
+def get_night_settings_endpoint(
+    user: Dict[str, Any] = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """Retrieve configurable operational night hours and safety thresholds."""
+    return get_system_settings()
+
+
+@router.post("/api/operations/night-settings")
+def update_night_settings_endpoint(
+    payload: Dict[str, Any],
+    user: Dict[str, Any] = Depends(require_admin)
+) -> Dict[str, Any]:
+    """Authorized Depot Admin updates night hours and threshold rules."""
+    if "night_start_hour" in payload:
+        start_hr = int(payload["night_start_hour"])
+        if not (0 <= start_hr <= 23):
+            raise HTTPException(status_code=400, detail="night_start_hour must be between 0 and 23.")
+        update_system_setting("night_start_hour", str(start_hr))
+
+    if "night_end_hour" in payload:
+        end_hr = int(payload["night_end_hour"])
+        if not (0 <= end_hr <= 23):
+            raise HTTPException(status_code=400, detail="night_end_hour must be between 0 and 23.")
+        update_system_setting("night_end_hour", str(end_hr))
+
+    if "unexpected_stop_threshold_mins" in payload:
+        thresh = int(payload["unexpected_stop_threshold_mins"])
+        update_system_setting("unexpected_stop_threshold_mins", str(thresh))
+
+    if "weather_demand_modifier_enabled" in payload:
+        val = "1" if payload["weather_demand_modifier_enabled"] else "0"
+        update_system_setting("weather_demand_modifier_enabled", val)
+
+    log_audit_event(
+        event_type="SYSTEM_SETTINGS_UPDATED",
+        actor_username=user["username"],
+        actor_role="depot_admin",
+        action_details=f"Updated night operational parameters: {payload}"
+    )
+
+    return get_system_settings()
+
+
+# ==================== Night Safety & Incident Endpoints ====================
+
+@router.get("/api/incidents")
+def list_safety_incidents_endpoint(
+    status: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    incident_type: Optional[str] = Query(None),
+    user: Dict[str, Any] = Depends(get_current_user)
+) -> List[Dict[str, Any]]:
+    """List safety incidents with optional status, severity, and type filters."""
+    return get_safety_incidents(status=status, severity=severity, incident_type=incident_type)
+
+
+@router.post("/api/incidents", status_code=201)
+def report_safety_incident_endpoint(
+    payload: Dict[str, Any],
+    user: Dict[str, Any] = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """Manually file a verified safety incident with full provenance."""
+    description = payload.get("description", "").strip()
+    if not description:
+        raise HTTPException(status_code=400, detail="Description is required.")
+
+    return create_safety_incident(data=payload, reported_by=user["username"])
+
+
+@router.patch("/api/incidents/{incident_id}/status")
+def update_incident_status_endpoint(
+    incident_id: str,
+    payload: Dict[str, Any],
+    user: Dict[str, Any] = Depends(require_admin)
+) -> Dict[str, Any]:
+    """Authorized Depot Admin acknowledges, escalates, or resolves an incident."""
+    new_status = payload.get("status")
+    if new_status not in ["ACKNOWLEDGED", "ESCALATED", "RESOLVED", "NEW"]:
+        raise HTTPException(status_code=400, detail="Invalid incident status.")
+
+    action_note = payload.get("action_note", "Status updated by operations admin.")
+    responder = payload.get("assigned_responder")
+
+    try:
+        return update_safety_incident_status(
+            incident_id=incident_id,
+            new_status=new_status,
+            actor_username=user["username"],
+            action_note=action_note,
+            assigned_responder=responder
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+# ==================== Police & Emergency Escalation Endpoints ====================
+
+@router.get("/api/emergency/contacts")
+def list_emergency_contacts_endpoint(
+    user: Dict[str, Any] = Depends(get_current_user)
+) -> List[Dict[str, Any]]:
+    """Retrieve verified police and emergency service agency contacts."""
+    return get_emergency_contacts(only_active=True)
+
+
+@router.post("/api/emergency/contacts", status_code=201)
+def add_emergency_contact_endpoint(
+    payload: Dict[str, Any],
+    user: Dict[str, Any] = Depends(require_admin)
+) -> Dict[str, Any]:
+    """Register a new authorized police or medical agency contact."""
+    if not payload.get("agency_name") or not payload.get("phone"):
+        raise HTTPException(status_code=400, detail="Agency name and phone are required.")
+    return create_emergency_contact(payload)
+
+
+@router.post("/api/emergency/escalate")
+def escalate_to_police_endpoint(
+    payload: Dict[str, Any],
+    user: Dict[str, Any] = Depends(require_admin)
+) -> Dict[str, Any]:
+    """Escalate a verified safety incident to police or emergency dispatch."""
+    incident_id = payload.get("incident_id")
+    contact_id = payload.get("contact_id")
+    notes = payload.get("additional_notes", "")
+
+    if not incident_id or not contact_id:
+        raise HTTPException(status_code=400, detail="incident_id and contact_id are required.")
+
+    try:
+        return create_police_escalation(
+            incident_id=incident_id,
+            contact_id=int(contact_id),
+            operator_username=user["username"],
+            additional_notes=notes
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/api/emergency/escalations")
+def list_police_escalations_endpoint(
+    incident_id: Optional[str] = Query(None),
+    user: Dict[str, Any] = Depends(get_current_user)
+) -> List[Dict[str, Any]]:
+    """List historical emergency agency escalation records."""
+    return get_police_escalations(incident_id=incident_id)
+
+
+@router.patch("/api/emergency/escalations/{escalation_id}/status")
+def update_police_ack_status_endpoint(
+    escalation_id: str,
+    payload: Dict[str, Any],
+    user: Dict[str, Any] = Depends(require_admin)
+) -> Dict[str, Any]:
+    """Record officer acknowledgement or police patrol response status."""
+    ack_status = payload.get("police_ack_status", "ACKNOWLEDGED_BY_OFFICER")
+    notes = payload.get("police_response_notes", "Patrol unit deployed.")
+
+    try:
+        return update_police_escalation_status(
+            escalation_id=escalation_id,
+            ack_status=ack_status,
+            response_notes=notes,
+            actor_username=user["username"]
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+# ==================== Word Report Download (.docx) ====================
+
+@router.get("/api/operations-report/download-docx")
+def download_docx_report_endpoint(
+    user: Dict[str, Any] = Depends(get_current_user)
+) -> Response:
+    """Generate and download a publication-grade Microsoft Word (.docx) Operations Report."""
+    try:
+        buf = generate_overall_docx_report()
+        filename = f"FestivalFlow_Overall_Report_{datetime.now().strftime('%Y-%m-%d')}.docx"
+
+        return Response(
+            content=buf.getvalue(),
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={
+                "Content-Disposition": f"attachment; filename=\"{filename}\"",
+                "Access-Control-Expose-Headers": "Content-Disposition"
+            }
+        )
+    except Exception as e:
+        logger.error(f"Docx report generation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate Word report: {str(e)}")
+
 
 
 

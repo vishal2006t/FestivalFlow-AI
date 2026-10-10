@@ -1,5 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import OperationsReportView from './OperationsReportView';
+import SmartAllocationView from './SmartAllocationView';
+import DayAllocationView from './DayAllocationView';
+import NightOperationsView from './NightOperationsView';
+import NightSafetyIncidentsView from './NightSafetyIncidentsView';
+import PoliceEscalationView from './PoliceEscalationView';
 import CameraViewPage from './CameraViewPage';
 import MapTrackingPage from './MapTrackingPage';
 import DriverAssignmentsPage from './DriverAssignmentsPage';
@@ -15,7 +20,10 @@ import {
   XIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
-  ShieldCheckIcon
+  ShieldCheckIcon,
+  ZapIcon,
+  ShieldAlertIcon,
+  PhoneIcon
 } from './Icons';
 
 /**
@@ -322,34 +330,73 @@ function DepotAdminDashboard({
     }
   };
 
+  const [incidentToEscalate, setIncidentToEscalate] = useState(null);
+
+  const handleTriggerEscalation = (inc) => {
+    setIncidentToEscalate(inc);
+    setActiveTab('police_escalation');
+  };
+
   const isAllocationPending =
     report?.bus_allocation_recommendation?.status === 'PENDING_APPROVAL';
 
-  // Navigation Items Specification
+  // Navigation Items Specification (Sections 1-7 as requested)
   const navItems = [
     {
       id: 'report',
-      label: 'Operations Report',
+      label: 'Overview & Reports',
       icon: FileTextIcon,
       badge: isAllocationPending ? 'Pending' : null,
       badgeType: 'amber'
     },
     {
+      id: 'day_allocation',
+      label: 'Common / Day Allocation',
+      icon: SunIcon,
+      badge: null
+    },
+    {
+      id: 'smart_allocation',
+      label: 'Smart Allocation',
+      icon: ZapIcon,
+      badge: 'Weather+Timing',
+      badgeType: 'emerald'
+    },
+    {
+      id: 'night_operations',
+      label: 'Night Operations',
+      icon: MoonIcon,
+      badge: '20:00 - 05:00',
+      badgeType: 'purple'
+    },
+    {
+      id: 'night_safety',
+      label: 'Night Safety & Incidents',
+      icon: ShieldAlertIcon,
+      badge: null
+    },
+    {
+      id: 'police_escalation',
+      label: 'Police / Emergency Notifications',
+      icon: PhoneIcon,
+      badge: null
+    },
+    {
       id: 'assignments',
-      label: 'Driver Assignments',
+      label: 'Existing Assignments and Live Tracking',
       icon: ClipboardListIcon,
       badge: null
     },
     {
       id: 'map',
-      label: 'Map & Tracking',
+      label: 'Fleet Map View',
       icon: MapPinIcon,
       badge: 'Simulated',
       badgeType: 'subtle'
     },
     {
       id: 'camera',
-      label: 'Camera View',
+      label: 'Platform Cameras',
       icon: VideoIcon,
       badge: null
     }
@@ -358,14 +405,39 @@ function DepotAdminDashboard({
   // Page titles and contextual subtitles
   const pageMeta = {
     report: {
-      title: 'Operations Report',
-      subtitle: 'Understand passenger demand and make informed bus allocation decisions.',
-      breadcrumb: 'Operations Report'
+      title: 'Overview & Operations Report',
+      subtitle: 'Consolidated daytime and night operations intelligence, demand analysis, and downloadable Word audit report.',
+      breadcrumb: 'Overview & Reports'
+    },
+    day_allocation: {
+      title: 'Common / Daytime Transit Allocation',
+      subtitle: 'Regular daytime festival passenger arrivals, scheduled frequency, and baseline corridor fleet.',
+      breadcrumb: 'Common / Day Allocation'
+    },
+    smart_allocation: {
+      title: 'Smart Bus Allocation Engine',
+      subtitle: 'Multi-input optimization powered by live meteorological telematics, event finale timings, and depot proximity.',
+      breadcrumb: 'Smart Allocation'
+    },
+    night_operations: {
+      title: 'Night Transit Operations & Egress Command',
+      subtitle: 'Post-headline audience departure management, configurable night operating hours, and standby bus staging.',
+      breadcrumb: 'Night Operations'
+    },
+    night_safety: {
+      title: 'Night Safety Monitoring & Incidents',
+      subtitle: 'Real condition surveillance: vehicle breakdowns, unexpected dwell stops, route deviations, and crowd surges.',
+      breadcrumb: 'Night Safety & Incidents'
+    },
+    police_escalation: {
+      title: 'Police / Emergency Notifications & Escalation',
+      subtitle: 'Controlled incident briefing and verified escalation protocols for law enforcement, traffic division, and EMS desks.',
+      breadcrumb: 'Police / Emergency Notifications'
     },
     assignments: {
-      title: 'Driver Assignments',
-      subtitle: 'Manage transit corridor dispatch orders, approvals, and driver responses.',
-      breadcrumb: 'Driver Assignments'
+      title: 'Existing Assignments and Live Tracking',
+      subtitle: 'Manage active transit corridor dispatch orders, driver status acknowledgements, and route telematics.',
+      breadcrumb: 'Existing Assignments and Live Tracking'
     },
     map: {
       title: 'Map & Live Fleet Tracking',
@@ -373,13 +445,14 @@ function DepotAdminDashboard({
       breadcrumb: 'Map & Tracking'
     },
     camera: {
-      title: 'Camera View',
+      title: 'Platform Camera Views',
       subtitle: 'Perimeter turnstiles and platform crowd density monitoring preview.',
       breadcrumb: 'Camera View'
     }
   };
 
   const currentPage = pageMeta[activeTab] || pageMeta.report;
+
 
   return (
     <div className={`ff-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
@@ -588,6 +661,56 @@ function DepotAdminDashboard({
               onGenerateReport={() => loadOperationsReport(true)}
               onApproveAllocation={handleApproveAllocation}
               onNavigateToAssignments={() => setActiveTab('assignments')}
+              apiBase={apiBase}
+              token={token}
+              showToast={showToast}
+            />
+          )}
+
+          {activeTab === 'day_allocation' && (
+            <DayAllocationView
+              apiBase={apiBase}
+              token={token}
+              showToast={showToast}
+            />
+          )}
+
+          {activeTab === 'smart_allocation' && (
+            <SmartAllocationView
+              apiBase={apiBase}
+              token={token}
+              showToast={showToast}
+              user={user}
+            />
+          )}
+
+          {activeTab === 'night_operations' && (
+            <NightOperationsView
+              apiBase={apiBase}
+              token={token}
+              showToast={showToast}
+              onNavigateToTab={setActiveTab}
+            />
+          )}
+
+          {activeTab === 'night_safety' && (
+            <NightSafetyIncidentsView
+              apiBase={apiBase}
+              token={token}
+              showToast={showToast}
+              user={user}
+              onEscalateIncident={handleTriggerEscalation}
+            />
+          )}
+
+          {activeTab === 'police_escalation' && (
+            <PoliceEscalationView
+              apiBase={apiBase}
+              token={token}
+              showToast={showToast}
+              user={user}
+              initialIncidentToEscalate={incidentToEscalate}
+              onClearInitialIncident={() => setIncidentToEscalate(null)}
             />
           )}
 

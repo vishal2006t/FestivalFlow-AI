@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import './App.css';
 import LandingPage from './components/LandingPage';
-import LoginPage from './components/LoginPage';
 import AdminLoginPage from './components/AdminLoginPage';
 import DriverLoginPage from './components/DriverLoginPage';
 import DepotAdminDashboard from './components/DepotAdminDashboard';
@@ -35,7 +34,7 @@ function App() {
   });
 
   const [currentPath, setCurrentPath] = useState(() => window.location.pathname || '/');
-  const [theme, setTheme] = useState(() => localStorage.getItem('ff_theme') || 'light');
+  const [theme, setTheme] = useState(() => localStorage.getItem('ff_theme') || 'dark');
   const [toast, setToast] = useState({ message: '', type: 'info' });
 
   // Listen for browser forward/back buttons
@@ -136,7 +135,7 @@ function App() {
         return null;
       }
       return (
-        <LoginPage
+        <AdminLoginPage
           onLoginSuccess={handleLoginSuccess}
           onNavigate={navigate}
           theme={theme}
@@ -221,12 +220,13 @@ function App() {
         return null;
       }
       return (
-        <DriverLoginPage
+        <AdminLoginPage
           onLoginSuccess={handleLoginSuccess}
           onNavigate={navigate}
           theme={theme}
           toggleTheme={toggleTheme}
           apiBase={API_BASE}
+          initialRole="driver"
         />
       );
     }

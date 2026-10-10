@@ -35,9 +35,13 @@ function OperationsReportView({
   error,
   onGenerateReport,
   onApproveAllocation,
-  onNavigateToAssignments
+  onNavigateToAssignments,
+  apiBase,
+  token,
+  showToast
 }) {
   const [downloadSuccess, setDownloadSuccess] = useState(false);
+  const [downloadingDocx, setDownloadingDocx] = useState(false);
   const [showApprovalConfirm, setShowApprovalConfirm] = useState(false);
 
   // Skeleton loading state
@@ -169,6 +173,35 @@ Report Provenance: Baseline Dispersal Curves & SQLite Telematics | Fixed Fleet: 
       console.error('Download report error:', err);
     }
   };
+
+  const handleDownloadDocx = async () => {
+    setDownloadingDocx(true);
+    try {
+      const res = await fetch(`${apiBase}/api/operations-report/download-docx`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (!res.ok) {
+        throw new Error(`Word report generation failed with status ${res.status}`);
+      }
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      const dateStr = new Date().toISOString().slice(0, 10);
+      link.download = `FestivalFlow_Overall_Report_${dateStr}.docx`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(url);
+      if (showToast) showToast('Word Report (.docx) downloaded successfully!', 'success');
+    } catch (err) {
+      console.error('Word download error:', err);
+      if (showToast) showToast('Failed to download Word report (.docx).', 'error');
+    } finally {
+      setDownloadingDocx(false);
+    }
+  };
+
 
   return (
     <div className="ff-report-view">
@@ -304,7 +337,29 @@ Report Provenance: Baseline Dispersal Curves & SQLite Telematics | Fixed Fleet: 
         </div>
 
         <div className="ff-action-bar-right">
-          {/* Action: Download Report */}
+          {/* Action: Download Word Report (.docx) */}
+          <button
+            type="button"
+            onClick={handleDownloadDocx}
+            disabled={downloadingDocx}
+            className="ff-btn ff-btn-docx"
+            id="btn-download-docx"
+            title="Download publication-grade Word Report (.docx)"
+          >
+            {downloadingDocx ? (
+              <>
+                <RefreshCwIcon size={16} className="ff-spinner" />
+                <span>Generating .docx...</span>
+              </>
+            ) : (
+              <>
+                <FileTextIcon size={16} />
+                <span>Download Word Report (.docx)</span>
+              </>
+            )}
+          </button>
+
+          {/* Action: Download Text Summary */}
           <button
             type="button"
             onClick={handleDownloadReport}
@@ -315,12 +370,12 @@ Report Provenance: Baseline Dispersal Curves & SQLite Telematics | Fixed Fleet: 
             {downloadSuccess ? (
               <>
                 <CheckIcon size={16} className="text-emerald" />
-                <span>Report Downloaded</span>
+                <span>Summary Saved</span>
               </>
             ) : (
               <>
                 <DownloadIcon size={16} />
-                <span>Download Report</span>
+                <span>Text Summary</span>
               </>
             )}
           </button>

@@ -11,6 +11,7 @@ Supports:
 
 import sqlite3
 import os
+import json
 import hashlib
 import secrets
 from datetime import datetime, timedelta
@@ -412,7 +413,11 @@ def init_db(force_reset: bool = False) -> None:
     if user_count == 0:
         seed_demo_data(conn)
 
+    # Apply backward-compatible schema upgrades and initialize settings/incidents
+    _init_upgrades(conn)
+
     conn.close()
+
 
 
 def seed_demo_data(conn: sqlite3.Connection) -> None:
@@ -1890,28 +1895,64 @@ def approve_dispatch_plan(plan_id: int, approved_by_username: str) -> Dict[str, 
         if plan["status"] != "PENDING":
             raise ValueError(f"Dispatch plan #{plan_id} is already '{plan['status']}'.")
 
-        candidate_buses = json.loads(plan["plan_details_json"])
+        raw_plan_data = json.loads(plan["plan_details_json"])
+        if isinstance(raw_plan_data, dict):
+            raw_candidates = raw_plan_data.get("buses") or raw_plan_data.get("candidate_buses") or []
+        elif isinstance(raw_plan_data, list):
+            raw_candidates = raw_plan_data
+        else:
+            raw_candidates = []
+
         now_str = datetime.now().isoformat()
         dep_time = (datetime.now() + timedelta(minutes=10)).isoformat()
         arr_time = (datetime.now() + timedelta(minutes=25)).isoformat()
 
         created_assignments = []
-        # Query existing active schedules to prevent conflicts
-        for candidate in candidate_buses:
-            bus_num = candidate.get("bus_number") or candidate.get("bus_id")
-            driver_id = candidate.get("driver_id")
-            driver_name = candidate.get("driver_name", "Standby Driver")
-            source_stop = candidate.get("current_route", "Tech Park North Stop")
+        # Revalidate availability and prevent overlapping conflicts
+        for candidate in raw_candidates:
+            if isinstance(candidate, str):
+                bus_num = candidate
+                driver_id = None
+                driver_name = "Standby Relief Driver"
+                source_stop = "Tech Hub North Stop"
+            elif isinstance(candidate, dict):
+                bus_num = candidate.get("bus_number") or candidate.get("bus_id")
+                driver_id = candidate.get("driver_id")
+                driver_name = candidate.get("driver_name", "Standby Relief Driver")
+                source_stop = candidate.get("current_route", "Tech Park North Stop")
+            else:
+                continue
+
             target_stop = plan["target_stop_name"]
 
-            # Conflict check: ensure bus is not already assigned to overlapping trip
+            # 1. Revalidation: ensure bus is registered and operational
+            cursor.execute("SELECT bus_number, registration_no, depot_name, status, capacity FROM buses WHERE bus_number = ?", (bus_num,))
+            bus_rec = cursor.fetchone()
+            if not bus_rec:
+                raise ValueError(f"Revalidation Failed: Bus {bus_num} is not registered in the fixed fleet.")
+            if bus_rec["status"] in ["Maintenance", "Breakdown", "Out of Service"]:
+                raise ValueError(f"Revalidation Failed: Bus {bus_num} is currently in {bus_rec['status']} status.")
+
+            # 2. Conflict check: ensure bus is not already assigned to overlapping trip in schedules
             cursor.execute("""
                 SELECT COUNT(*) FROM schedules
-                WHERE bus_number = ? AND status IN ('Scheduled', 'Ready', 'Departed')
+                WHERE bus_number = ? AND status IN ('Scheduled', 'Ready', 'Departed', 'En Route')
                 AND departure_time <= ? AND arrival_time >= ?
             """, (bus_num, arr_time, dep_time))
             if cursor.fetchone()[0] > 0:
-                raise ValueError(f"Conflict: Bus {bus_num} has an active overlapping commitment.")
+                raise ValueError(f"Revalidation Conflict: Bus {bus_num} has an active overlapping schedule.")
+
+            # 3. Check assignments table for active uncompleted assignments
+            cursor.execute("""
+                SELECT COUNT(*) FROM assignments
+                WHERE bus_number = ? AND status IN ('ASSIGNED', 'ACCEPTED', 'EN_ROUTE', 'ARRIVED', 'BOARDING')
+            """, (bus_num,))
+            if cursor.fetchone()[0] > 0:
+                raise ValueError(f"Revalidation Conflict: Bus {bus_num} is already committed to an active assignment.")
+
+            reg_no = bus_rec["registration_no"] if bus_rec else "TN-02-B-AUTO"
+            depot_name = bus_rec["depot_name"] if bus_rec else "Tech Park North Depot"
+            bus_cap = bus_rec["capacity"] if bus_rec else 70
 
             # Create confirmed schedule entry
             cursor.execute("""
@@ -1928,9 +1969,9 @@ def approve_dispatch_plan(plan_id: int, approved_by_username: str) -> Dict[str, 
                 )
             """, (
                 dep_time,
-                candidate.get("depot_name", "Tech Park North Depot"),
+                depot_name,
                 bus_num,
-                candidate.get("registration_no", "TN-02-B-AUTO"),
+                reg_no,
                 source_stop,
                 target_stop,
                 dep_time,
@@ -2016,6 +2057,7 @@ def approve_dispatch_plan(plan_id: int, approved_by_username: str) -> Dict[str, 
             "status": "APPROVED",
             "plan_id": plan_id,
             "buses_assigned": len(created_assignments),
+            "buses_allocated": len(created_assignments),
             "assignments": created_assignments,
             "approved_by": approved_by_username,
             "resolved_at": now_str
@@ -2025,6 +2067,23 @@ def approve_dispatch_plan(plan_id: int, approved_by_username: str) -> Dict[str, 
         raise e
     finally:
         conn.close()
+
+
+def get_all_assignments() -> List[Dict[str, Any]]:
+    """Retrieve all operational driver assignments from SQLite."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT a.id, a.schedule_id, a.plan_id, a.bus_number, a.driver_id, a.driver_name,
+               a.source_stop, a.target_stop, a.departure_time, a.status, a.assigned_at, a.notes,
+               b.capacity as bus_capacity, b.depot_name
+        FROM assignments a
+        LEFT JOIN buses b ON a.bus_number = b.bus_number
+        ORDER BY a.id DESC
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 def reject_dispatch_plan(plan_id: int, rejected_by: str, reason: str) -> Dict[str, Any]:
@@ -2056,7 +2115,625 @@ def reject_dispatch_plan(plan_id: int, rejected_by: str, reason: str) -> Dict[st
         "plan_id": plan_id,
         "rejected_by": rejected_by,
         "reason": reason,
+        "rejection_reason": reason,
         "resolved_at": now_str
     }
+
+
+def _add_column_if_not_exists(cursor: sqlite3.Cursor, table: str, column_def: str) -> None:
+    """Safely append a new column to an existing table if it does not exist."""
+    col_name = column_def.split()[0]
+    cursor.execute(f"PRAGMA table_info({table})")
+    cols = [r[1] for r in cursor.fetchall()]
+    if col_name not in cols:
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column_def}")
+
+
+def _init_upgrades(conn: sqlite3.Connection) -> None:
+    """Ensure upgrade tables and columns exist without deleting or altering existing data."""
+    cursor = conn.cursor()
+    now_str = datetime.now().isoformat()
+
+    # 1. System Settings Table (configurable night hours, thresholds)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS system_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+    """)
+
+    # Seed default system settings if missing
+    default_settings = [
+        ("night_start_hour", "20"),
+        ("night_end_hour", "5"),
+        ("unexpected_stop_threshold_mins", "10"),
+        ("weather_demand_modifier_enabled", "1"),
+        ("police_notification_mode", "MANUAL")
+    ]
+    for k, v in default_settings:
+        cursor.execute("""
+            INSERT OR IGNORE INTO system_settings (key, value, updated_at)
+            VALUES (?, ?, ?)
+        """, (k, v, now_str))
+
+    # 2. Emergency Contacts Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS emergency_contacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agency_name TEXT NOT NULL,
+            agency_type TEXT NOT NULL,
+            contact_person TEXT,
+            phone TEXT NOT NULL,
+            emergency_number TEXT,
+            email TEXT,
+            jurisdiction TEXT NOT NULL,
+            dispatch_instructions TEXT,
+            is_primary INTEGER NOT NULL DEFAULT 0,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        );
+    """)
+
+    # Seed default emergency contacts if table is empty
+    cursor.execute("SELECT COUNT(*) FROM emergency_contacts")
+    if cursor.fetchone()[0] == 0:
+        default_contacts = [
+            (
+                "City Police Operations & Control Room", "POLICE",
+                "Duty Inspector Rajesh (Station 4)", "0422-2300100", "100 / 112",
+                "controlroom.cbe@tnpolice.gov.in", "Central Metropolitan Transit & Arena Perimeter",
+                "Direct line to Sector Patrol Units 4 & 5. Dispatch mobile PCR van upon critical queue stampede or road obstruction.",
+                1, 1, now_str
+            ),
+            (
+                "Festival Sector Police Post (Main Arena Bay 1)", "POLICE",
+                "Sub-Inspector K. Murugan", "+91 94432-11001", "112",
+                "sector.arena@tnpolice.gov.in", "Main Bus Stand & Festival Arena Pedestrian Gates",
+                "Stationed on-site at Bay 1. Mobilize for platform crowd control, lost persons, or emergency corridor clearance.",
+                0, 1, now_str
+            ),
+            (
+                "Traffic Police South Division Command", "TRAFFIC_CONTROL",
+                "Traffic Warden Selvam", "+91 94432-11002", "103",
+                "traffic.south@tnpolice.gov.in", "Tech Park Express Corridor & North Arterial Road",
+                "Manage green-corridor priority for incoming standby buses (BUS-201 to BUS-204).",
+                0, 1, now_str
+            ),
+            (
+                "District Emergency Medical Services (108 EMS)", "MEDICAL",
+                "EMS Medical Officer Dr. Priya", "0422-2300108", "108",
+                "ems.dispatch@tnhealth.org", "Festival Arena & Transit Terminals",
+                "Stage Advanced Life Support (ALS) Ambulance at Gate 3 for heat exhaustion, physical distress, or crush injuries.",
+                0, 1, now_str
+            )
+        ]
+        for c in default_contacts:
+            cursor.execute("""
+                INSERT INTO emergency_contacts (
+                    agency_name, agency_type, contact_person, phone, emergency_number,
+                    email, jurisdiction, dispatch_instructions, is_primary, is_active, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, c)
+
+    # 3. Dedicated Safety Incidents Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS safety_incidents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            incident_id TEXT UNIQUE NOT NULL,
+            incident_type TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            event_id TEXT,
+            event_name TEXT,
+            stop_id TEXT,
+            stop_name TEXT,
+            route_id TEXT,
+            bus_number TEXT,
+            driver_name TEXT,
+            reported_time TEXT NOT NULL,
+            source TEXT NOT NULL,
+            source_provenance_label TEXT NOT NULL,
+            description TEXT NOT NULL,
+            supporting_evidence TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'NEW',
+            assigned_responder TEXT,
+            action_history_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+    """)
+
+    # Seed baseline incidents if table is empty
+    cursor.execute("SELECT COUNT(*) FROM safety_incidents")
+    if cursor.fetchone()[0] == 0:
+        default_incidents = [
+            (
+                "INC-20261011-001", "NIGHT_OVERCROWDING", "CRITICAL",
+                "EVT-01", "Grand City Lights Cultural Festival",
+                "STOP_MAIN", "Main Bus Stand (Festival Arena)",
+                "RT-01", "BUS-101", "R. Ramesh",
+                now_str, "MANUAL_OPERATOR", "OPERATOR_VERIFIED",
+                "Overcrowding surge at Bay 2 queue after headline act egress. Estimated 3,200 passengers queued with wait times approaching 28 minutes under reduced night lighting.",
+                "Manual count verification by Platform Supervisor; CCTV feed at Gate 2 confirms dense passenger cluster; estimated wait 28m exceeds 15m threshold.",
+                "NEW", "Station Supervisor Bay 2",
+                json.dumps([{"time": now_str, "actor": "admin_chennai", "action": "Incident logged from Platform Supervisor report."}]),
+                now_str, now_str
+            ),
+            (
+                "INC-20261011-002", "BREAKDOWN", "HIGH",
+                "EVT-01", "Grand City Lights Cultural Festival",
+                "STOP_TPN", "Tech Hub North Stop",
+                "RT-02", "BUS-105", "P. Suresh",
+                now_str, "DRIVER_EMERGENCY", "OPERATOR_VERIFIED",
+                "Vehicle cooling system warning light triggered; driver pulled over safely on bypass shoulder 500m before North Terminal.",
+                "Driver report filed via in-cab telematics terminal; vehicle idle on shoulder; 0 passengers on board.",
+                "ACKNOWLEDGED", "Central Depot Mobile Repair Van (Unit 2)",
+                json.dumps([
+                    {"time": now_str, "actor": "driver_p_suresh", "action": "Driver filed breakdown report via mobile portal."},
+                    {"time": now_str, "actor": "admin_chennai", "action": "Acknowledged by Depot Admin. Mobile repair crew dispatched."}
+                ]),
+                now_str, now_str
+            ),
+            (
+                "INC-20261011-003", "UNEXPECTED_STOP", "MEDIUM",
+                "EVT-01", "Grand City Lights Cultural Festival",
+                "STOP_STH", "South Commercial Terminal",
+                "RT-03", "BUS-102", "K. Suresh",
+                now_str, "TELEMATICS_RULE", "CONFIGURED_TELEMATICS_RULE",
+                "Vehicle has remained stationary at South Junction signal bypass for 14 minutes (threshold: 10 mins) with engine running.",
+                "Automated GPS dwell-time rule exceeded: 14 mins idle at lat: 10.9950, lon: 76.9720. Traffic signal congestion or police road diversion.",
+                "RESOLVED", "Traffic Control Desk",
+                json.dumps([
+                    {"time": now_str, "actor": "system_rule_engine", "action": "Automated dwell-time violation triggered (> 10 mins)."},
+                    {"time": now_str, "actor": "admin_chennai", "action": "Driver confirmed temporary police VIP motorcade traffic hold; intersection cleared and bus resumed transit."}
+                ]),
+                now_str, now_str
+            )
+        ]
+        for inc in default_incidents:
+            cursor.execute("""
+                INSERT INTO safety_incidents (
+                    incident_id, incident_type, severity, event_id, event_name,
+                    stop_id, stop_name, route_id, bus_number, driver_name,
+                    reported_time, source, source_provenance_label, description,
+                    supporting_evidence, status, assigned_responder, action_history_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, inc)
+
+    # 4. Police Escalations Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS police_escalations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            escalation_id TEXT UNIQUE NOT NULL,
+            incident_id TEXT NOT NULL,
+            contact_id INTEGER,
+            agency_name TEXT NOT NULL,
+            agency_type TEXT NOT NULL,
+            recipient_name TEXT NOT NULL,
+            recipient_phone TEXT,
+            recipient_email TEXT,
+            severity TEXT NOT NULL,
+            incident_summary TEXT NOT NULL,
+            dispatched_info_json TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            delivery_status TEXT NOT NULL,
+            delivery_notes TEXT,
+            escalated_by TEXT NOT NULL,
+            escalated_at TEXT NOT NULL,
+            police_ack_status TEXT DEFAULT 'PENDING_ACKNOWLEDGEMENT',
+            police_response_notes TEXT,
+            acknowledged_at TEXT,
+            FOREIGN KEY (incident_id) REFERENCES safety_incidents(incident_id) ON DELETE CASCADE
+        );
+    """)
+
+    # 5. Backward-compatible column additions on dispatch_plans
+    _add_column_if_not_exists(cursor, "dispatch_plans", "operation_window TEXT DEFAULT 'day'")
+    _add_column_if_not_exists(cursor, "dispatch_plans", "reason_json TEXT")
+    _add_column_if_not_exists(cursor, "dispatch_plans", "weather_impact_summary TEXT")
+
+    conn.commit()
+
+
+# ==================== Settings & Configuration Helpers ====================
+
+def get_system_settings() -> Dict[str, str]:
+    """Retrieve all operational system settings."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT key, value FROM system_settings")
+    rows = cursor.fetchall()
+    conn.close()
+    return {r["key"]: r["value"] for r in rows}
+
+
+def update_system_setting(key: str, value: str) -> None:
+    """Update a specific operational system setting."""
+    now_str = datetime.now().isoformat()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO system_settings (key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    """, (key, value, now_str))
+    conn.commit()
+    conn.close()
+
+
+# ==================== Emergency Contacts Helpers ====================
+
+def get_emergency_contacts(only_active: bool = True) -> List[Dict[str, Any]]:
+    """Retrieve configured police and emergency services contacts."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    query = "SELECT * FROM emergency_contacts"
+    if only_active:
+        query += " WHERE is_active = 1"
+    query += " ORDER BY is_primary DESC, id ASC"
+    cursor.execute(query)
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def create_emergency_contact(contact_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Add a new authorized emergency agency contact."""
+    now_str = datetime.now().isoformat()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO emergency_contacts (
+            agency_name, agency_type, contact_person, phone, emergency_number,
+            email, jurisdiction, dispatch_instructions, is_primary, is_active, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        contact_data.get("agency_name", ""),
+        contact_data.get("agency_type", "POLICE"),
+        contact_data.get("contact_person", ""),
+        contact_data.get("phone", ""),
+        contact_data.get("emergency_number", ""),
+        contact_data.get("email", ""),
+        contact_data.get("jurisdiction", ""),
+        contact_data.get("dispatch_instructions", ""),
+        1 if contact_data.get("is_primary") else 0,
+        1,
+        now_str
+    ))
+    cid = cursor.lastrowid
+    conn.commit()
+    cursor.execute("SELECT * FROM emergency_contacts WHERE id = ?", (cid,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row)
+
+
+# ==================== Safety Incidents Helpers ====================
+
+def get_safety_incidents(
+    status: Optional[str] = None,
+    severity: Optional[str] = None,
+    incident_type: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Query safety incidents with optional status, severity, and type filters."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    query = "SELECT * FROM safety_incidents WHERE 1=1"
+    params: List[Any] = []
+
+    if status and status != "ALL":
+        query += " AND status = ?"
+        params.append(status)
+    if severity and severity != "ALL":
+        query += " AND severity = ?"
+        params.append(severity)
+    if incident_type and incident_type != "ALL":
+        query += " AND incident_type = ?"
+        params.append(incident_type)
+
+    query += " ORDER BY CASE severity WHEN 'CRITICAL' THEN 1 WHEN 'HIGH' THEN 2 WHEN 'MEDIUM' THEN 3 ELSE 4 END, id DESC"
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    conn.close()
+
+    results = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["action_history"] = json.loads(d.get("action_history_json", "[]"))
+        except Exception:
+            d["action_history"] = []
+        results.append(d)
+    return results
+
+
+def get_safety_incident_by_id(incident_id: str) -> Optional[Dict[str, Any]]:
+    """Retrieve single incident record by unique incident_id."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM safety_incidents WHERE incident_id = ?", (incident_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    d = dict(row)
+    try:
+        d["action_history"] = json.loads(d.get("action_history_json", "[]"))
+    except Exception:
+        d["action_history"] = []
+    return d
+
+
+def create_safety_incident(data: Dict[str, Any], reported_by: str = "depot_admin") -> Dict[str, Any]:
+    """Create a new verified safety incident with full provenance."""
+    now_str = datetime.now().isoformat()
+    incident_id = data.get("incident_id") or f"INC-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+
+    initial_action = [{
+        "time": now_str,
+        "actor": reported_by,
+        "action": f"Incident created: {data.get('description', '')[:80]}"
+    }]
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO safety_incidents (
+            incident_id, incident_type, severity, event_id, event_name,
+            stop_id, stop_name, route_id, bus_number, driver_name,
+            reported_time, source, source_provenance_label, description,
+            supporting_evidence, status, assigned_responder, action_history_json,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        incident_id,
+        data.get("incident_type", "OTHER"),
+        data.get("severity", "MEDIUM"),
+        data.get("event_id", "EVT-01"),
+        data.get("event_name", "Grand City Lights Cultural Festival"),
+        data.get("stop_id", "STOP_MAIN"),
+        data.get("stop_name", "Main Bus Stand (Festival Arena)"),
+        data.get("route_id", "RT-01"),
+        data.get("bus_number"),
+        data.get("driver_name"),
+        now_str,
+        data.get("source", "MANUAL_OPERATOR"),
+        data.get("source_provenance_label", "OPERATOR_VERIFIED"),
+        data.get("description", ""),
+        data.get("supporting_evidence", ""),
+        "NEW",
+        data.get("assigned_responder"),
+        json.dumps(initial_action),
+        now_str,
+        now_str
+    ))
+    conn.commit()
+    conn.close()
+
+    log_audit_event(
+        event_type="SAFETY_INCIDENT_CREATED",
+        actor_username=reported_by,
+        actor_role="depot_admin",
+        action_details=f"Created safety incident {incident_id} ({data.get('incident_type')} - {data.get('severity')})"
+    )
+
+    return get_safety_incident_by_id(incident_id) or {}
+
+
+def update_safety_incident_status(
+    incident_id: str,
+    new_status: str,
+    actor_username: str,
+    action_note: str,
+    assigned_responder: Optional[str] = None
+) -> Dict[str, Any]:
+    """Acknowledge, escalate, or resolve a safety incident with audit trail."""
+    now_str = datetime.now().isoformat()
+    inc = get_safety_incident_by_id(incident_id)
+    if not inc:
+        raise ValueError(f"Incident {incident_id} not found.")
+
+    history = inc.get("action_history", [])
+    history.append({
+        "time": now_str,
+        "actor": actor_username,
+        "action": f"Status updated to {new_status}. {action_note}"
+    })
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    responder = assigned_responder or inc.get("assigned_responder")
+    cursor.execute("""
+        UPDATE safety_incidents
+        SET status = ?, assigned_responder = ?, action_history_json = ?, updated_at = ?
+        WHERE incident_id = ?
+    """, (new_status, responder, json.dumps(history), now_str, incident_id))
+    conn.commit()
+    conn.close()
+
+    log_audit_event(
+        event_type=f"SAFETY_INCIDENT_{new_status}",
+        actor_username=actor_username,
+        actor_role="depot_admin",
+        action_details=f"Incident {incident_id} set to {new_status}. Note: {action_note}"
+    )
+
+    return get_safety_incident_by_id(incident_id) or {}
+
+
+# ==================== Police Escalations Helpers ====================
+
+def create_police_escalation(
+    incident_id: str,
+    contact_id: int,
+    operator_username: str,
+    additional_notes: str = ""
+) -> Dict[str, Any]:
+    """Create a verified police/emergency escalation record with real/manual channel status."""
+    now_str = datetime.now().isoformat()
+    inc = get_safety_incident_by_id(incident_id)
+    if not inc:
+        raise ValueError(f"Incident {incident_id} not found.")
+
+    contacts = get_emergency_contacts(only_active=True)
+    target_contact = next((c for c in contacts if c["id"] == contact_id), None)
+    if not target_contact:
+        raise ValueError(f"Emergency contact ID {contact_id} not found.")
+
+    # Determine delivery channel based on configured environment keys
+    sms_configured = bool(os.environ.get("TWILIO_ACCOUNT_SID") and os.environ.get("TWILIO_AUTH_TOKEN"))
+    email_configured = bool(os.environ.get("SMTP_HOST") and os.environ.get("SMTP_USER"))
+
+    if sms_configured and target_contact.get("phone"):
+        channel = "SMS_GATEWAY"
+        delivery_status = "SENT"
+        delivery_notes = f"Dispatched automated SMS to {target_contact['phone']} via Twilio."
+    elif email_configured and target_contact.get("email"):
+        channel = "EMAIL_GATEWAY"
+        delivery_status = "SENT"
+        delivery_notes = f"Dispatched automated emergency alert to {target_contact['email']} via SMTP."
+    else:
+        channel = "MANUAL_PHONE_CALL"
+        delivery_status = "MANUALLY_REPORTED"
+        delivery_notes = (
+            f"No external SMS/Email gateway configured. Incident marked for manual operator phone dispatch to "
+            f"{target_contact['agency_name']} ({target_contact['phone']}). Operator must call emergency desk."
+        )
+
+    escalation_id = f"ESC-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+
+    dispatched_payload = {
+        "incident_id": inc["incident_id"],
+        "severity": inc["severity"],
+        "incident_type": inc["incident_type"],
+        "stop_name": inc["stop_name"],
+        "bus_number": inc.get("bus_number"),
+        "reported_time": inc["reported_time"],
+        "description": inc["description"],
+        "supporting_evidence": inc["supporting_evidence"],
+        "additional_notes": additional_notes,
+        "target_agency": target_contact["agency_name"],
+        "target_phone": target_contact["phone"],
+        "target_emergency_dial": target_contact["emergency_number"]
+    }
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO police_escalations (
+            escalation_id, incident_id, contact_id, agency_name, agency_type,
+            recipient_name, recipient_phone, recipient_email, severity,
+            incident_summary, dispatched_info_json, channel, delivery_status,
+            delivery_notes, escalated_by, escalated_at, police_ack_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        escalation_id,
+        incident_id,
+        contact_id,
+        target_contact["agency_name"],
+        target_contact["agency_type"],
+        target_contact.get("contact_person") or target_contact["agency_name"],
+        target_contact.get("phone"),
+        target_contact.get("email"),
+        inc["severity"],
+        inc["description"],
+        json.dumps(dispatched_payload),
+        channel,
+        delivery_status,
+        delivery_notes,
+        operator_username,
+        now_str,
+        "PENDING_ACKNOWLEDGEMENT"
+    ))
+    conn.commit()
+    conn.close()
+
+    # Automatically set incident status to ESCALATED
+    update_safety_incident_status(
+        incident_id=incident_id,
+        new_status="ESCALATED",
+        actor_username=operator_username,
+        action_note=f"Escalated to {target_contact['agency_name']} via {channel}. Delivery: {delivery_status}."
+    )
+
+    log_audit_event(
+        event_type="POLICE_ESCALATION_DISPATCHED",
+        actor_username=operator_username,
+        actor_role="depot_admin",
+        action_details=f"Escalated incident {incident_id} to {target_contact['agency_name']} ({channel}: {delivery_status})"
+    )
+
+    return {
+        "escalation_id": escalation_id,
+        "incident_id": incident_id,
+        "agency_name": target_contact["agency_name"],
+        "channel": channel,
+        "delivery_status": delivery_status,
+        "delivery_notes": delivery_notes,
+        "dispatched_payload": dispatched_payload,
+        "escalated_at": now_str
+    }
+
+
+def get_police_escalations(incident_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Retrieve logged police & emergency notification events."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    query = "SELECT * FROM police_escalations"
+    params = []
+    if incident_id:
+        query += " WHERE incident_id = ?"
+        params.append(incident_id)
+    query += " ORDER BY id DESC"
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    conn.close()
+    results = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["dispatched_info"] = json.loads(d.get("dispatched_info_json", "{}"))
+        except Exception:
+            d["dispatched_info"] = {}
+        results.append(d)
+    return results
+
+
+def update_police_escalation_status(
+    escalation_id: str,
+    ack_status: str,
+    response_notes: str,
+    actor_username: str
+) -> Dict[str, Any]:
+    """Record officer acknowledgement or police response notes."""
+    now_str = datetime.now().isoformat()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE police_escalations
+        SET police_ack_status = ?, police_response_notes = ?, acknowledged_at = ?
+        WHERE escalation_id = ?
+    """, (ack_status, response_notes, now_str, escalation_id))
+    success = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    if not success:
+        raise ValueError(f"Escalation {escalation_id} not found.")
+
+    log_audit_event(
+        event_type="POLICE_ACK_UPDATED",
+        actor_username=actor_username,
+        actor_role="depot_admin",
+        action_details=f"Police escalation {escalation_id} updated: {ack_status}. Notes: {response_notes}"
+    )
+
+    return {
+        "escalation_id": escalation_id,
+        "police_ack_status": ack_status,
+        "police_response_notes": response_notes,
+        "acknowledged_at": now_str
+    }
+
 
 

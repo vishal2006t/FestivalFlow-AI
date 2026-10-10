@@ -1,6 +1,6 @@
 """FestivalFlow AI - Predictive Festival Crowd and Bus Reallocation System.
 Main FastAPI application entrypoint.
-Reload trigger: 2026-10-11T01:38.
+Reload trigger: 2026-10-11T02:27:45.
 """
 
 import os
