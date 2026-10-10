@@ -68,7 +68,19 @@ async def add_security_headers(request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: https: blob:; "
+        "font-src 'self' data:; "
+        "connect-src 'self' http://localhost:* http://127.0.0.1:* https://api.open-meteo.com; "
+        "frame-ancestors 'none'; "
+        "object-src 'none'; "
+        "base-uri 'self';"
+    )
     return response
+
 
 # Include all modular API routes
 app.include_router(api_router)
@@ -80,7 +92,19 @@ from fastapi.staticfiles import StaticFiles
 if os.path.exists(ASSETS_DIR):
     app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")
 
+from fastapi.responses import FileResponse
+
+@app.get("/favicon.svg")
+@app.get("/favicon.ico")
+def serve_favicon():
+    favicon_path = os.path.join(STATIC_DIR, "favicon.svg")
+    if os.path.exists(favicon_path):
+        return FileResponse(favicon_path, media_type="image/svg+xml")
+    return HTMLResponse("", status_code=204)
+
 @app.get("/dashboard", response_class=HTMLResponse)
+@app.get("/login", response_class=HTMLResponse)
+@app.get("/login/{path:path}", response_class=HTMLResponse)
 @app.get("/admin", response_class=HTMLResponse)
 @app.get("/admin/{path:path}", response_class=HTMLResponse)
 @app.get("/driver", response_class=HTMLResponse)

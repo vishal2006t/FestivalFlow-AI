@@ -833,14 +833,16 @@ def delete_session(token: str) -> None:
 
 
 def get_user_by_username(username: str) -> Optional[Dict[str, Any]]:
-    """Look up a user account by username."""
+    """Look up a user account by username (case-insensitive and trimmed)."""
+    if not username or not username.strip():
+        return None
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
         SELECT id, username, password_hash, salt, role, full_name, depot_name
         FROM users
-        WHERE username = ?
-    """, (username,))
+        WHERE LOWER(username) = LOWER(?)
+    """, (username.strip(),))
     row = cursor.fetchone()
     conn.close()
     if not row:

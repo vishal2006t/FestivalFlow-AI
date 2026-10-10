@@ -117,22 +117,60 @@ function App() {
     // 2. Admin Portal Root: '/admin'
     if (path === '/admin') {
       if (token && user && (user.role === 'depot_admin' || user.role === 'admin')) {
-        navigate('/admin/dashboard');
-        return null;
+        return (
+          <DepotAdminDashboard
+            user={user}
+            token={token}
+            onLogout={() => handleLogout('/admin/login')}
+            theme={theme}
+            toggleTheme={toggleTheme}
+            apiBase={API_BASE}
+            showToast={showToast}
+            onNavigate={navigate}
+          />
+        );
       }
-      navigate('/admin/login');
-      return null;
+      return (
+        <AdminLoginPage
+          onLoginSuccess={handleLoginSuccess}
+          onNavigate={navigate}
+          theme={theme}
+          toggleTheme={toggleTheme}
+          apiBase={API_BASE}
+          initialRole="depot_admin"
+        />
+      );
     }
 
     // 2.5 General Login Page: '/login'
     if (path === '/login') {
       if (token && user) {
         if (user.role === 'driver') {
-          navigate('/driver/dashboard');
-        } else {
-          navigate('/admin/dashboard');
+          return (
+            <BusDriverDashboard
+              user={user}
+              token={token}
+              onLogout={() => handleLogout('/driver/login')}
+              theme={theme}
+              toggleTheme={toggleTheme}
+              apiBase={API_BASE}
+              showToast={showToast}
+              onNavigate={navigate}
+            />
+          );
         }
-        return null;
+        return (
+          <DepotAdminDashboard
+            user={user}
+            token={token}
+            onLogout={() => handleLogout('/admin/login')}
+            theme={theme}
+            toggleTheme={toggleTheme}
+            apiBase={API_BASE}
+            showToast={showToast}
+            onNavigate={navigate}
+          />
+        );
       }
       return (
         <AdminLoginPage
@@ -149,8 +187,18 @@ function App() {
     // 3. Admin Login Page: '/admin/login'
     if (path === '/admin/login') {
       if (token && user && (user.role === 'depot_admin' || user.role === 'admin')) {
-        navigate('/admin/dashboard');
-        return null;
+        return (
+          <DepotAdminDashboard
+            user={user}
+            token={token}
+            onLogout={() => handleLogout('/admin/login')}
+            theme={theme}
+            toggleTheme={toggleTheme}
+            apiBase={API_BASE}
+            showToast={showToast}
+            onNavigate={navigate}
+          />
+        );
       }
       return (
         <AdminLoginPage
@@ -167,8 +215,16 @@ function App() {
     // 4. Admin Dashboard: '/admin/dashboard'
     if (path === '/admin/dashboard') {
       if (!token || !user) {
-        navigate('/admin/login');
-        return null;
+        return (
+          <AdminLoginPage
+            onLoginSuccess={handleLoginSuccess}
+            onNavigate={navigate}
+            theme={theme}
+            toggleTheme={toggleTheme}
+            apiBase={API_BASE}
+            initialRole="depot_admin"
+          />
+        );
       }
       if (user.role !== 'depot_admin' && user.role !== 'admin') {
         return (
@@ -206,18 +262,46 @@ function App() {
     // 5. Driver Portal Root: '/driver'
     if (path === '/driver') {
       if (token && user && user.role === 'driver') {
-        navigate('/driver/dashboard');
-        return null;
+        return (
+          <BusDriverDashboard
+            user={user}
+            token={token}
+            onLogout={() => handleLogout('/driver/login')}
+            theme={theme}
+            toggleTheme={toggleTheme}
+            apiBase={API_BASE}
+            showToast={showToast}
+            onNavigate={navigate}
+          />
+        );
       }
-      navigate('/driver/login');
-      return null;
+      return (
+        <AdminLoginPage
+          onLoginSuccess={handleLoginSuccess}
+          onNavigate={navigate}
+          theme={theme}
+          toggleTheme={toggleTheme}
+          apiBase={API_BASE}
+          initialRole="driver"
+        />
+      );
     }
 
     // 6. Driver Login Page: '/driver/login'
     if (path === '/driver/login') {
       if (token && user && user.role === 'driver') {
-        navigate('/driver/dashboard');
-        return null;
+        return (
+          <BusDriverDashboard
+            user={user}
+            token={token}
+            onLogout={() => handleLogout('/driver/login')}
+            theme={theme}
+            toggleTheme={toggleTheme}
+            apiBase={API_BASE}
+            showToast={showToast}
+            onNavigate={navigate}
+          />
+        );
       }
       return (
         <AdminLoginPage
@@ -234,8 +318,16 @@ function App() {
     // 7. Driver Dashboard: '/driver/dashboard'
     if (path === '/driver/dashboard') {
       if (!token || !user) {
-        navigate('/driver/login');
-        return null;
+        return (
+          <AdminLoginPage
+            onLoginSuccess={handleLoginSuccess}
+            onNavigate={navigate}
+            theme={theme}
+            toggleTheme={toggleTheme}
+            apiBase={API_BASE}
+            initialRole="driver"
+          />
+        );
       }
       if (user.role !== 'driver') {
         return (
@@ -274,14 +366,39 @@ function App() {
     if (path === '/dashboard') {
       if (token && user) {
         if (user.role === 'driver') {
-          navigate('/driver/dashboard');
-        } else {
-          navigate('/admin/dashboard');
+          return (
+            <BusDriverDashboard
+              user={user}
+              token={token}
+              onLogout={() => handleLogout('/driver/login')}
+              theme={theme}
+              toggleTheme={toggleTheme}
+              apiBase={API_BASE}
+              showToast={showToast}
+              onNavigate={navigate}
+            />
+          );
         }
-      } else {
-        navigate('/');
+        return (
+          <DepotAdminDashboard
+            user={user}
+            token={token}
+            onLogout={() => handleLogout('/admin/login')}
+            theme={theme}
+            toggleTheme={toggleTheme}
+            apiBase={API_BASE}
+            showToast={showToast}
+            onNavigate={navigate}
+          />
+        );
       }
-      return null;
+      return (
+        <LandingPage
+          onNavigate={navigate}
+          theme={theme}
+          toggleTheme={toggleTheme}
+        />
+      );
     }
 
     // 9. Unknown Path Fallback -> Landing Page

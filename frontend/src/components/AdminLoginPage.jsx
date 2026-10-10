@@ -1,25 +1,22 @@
 import React, { useState, useEffect } from 'react';
 
-// Pre-seeded development demo credentials from SQLite database
-// In production builds, import.meta.env.DEV is replaced with 'false' and tree-shaken
-const DEV_DEMO_ACCOUNTS = import.meta.env.DEV
-  ? {
-      depot_admin: {
-        username: 'admin_chennai',
-        password: 'Admin@Depot2026',
-        role: 'depot_admin',
-        roleLabel: 'Central Depot Admin (12 Scheduled Buses)',
-        roleTitle: 'Depot Operations & Strategy'
-      },
-      driver: {
-        username: 'driver_ramesh',
-        password: 'Driver@2026',
-        role: 'driver',
-        roleLabel: 'Bus Driver (Assigned BUS-201 • Festival Express)',
-        roleTitle: 'Field Operations & Telematics'
-      }
-    }
-  : null;
+// Pre-seeded prototype demo credentials from SQLite database
+const DEV_DEMO_ACCOUNTS = {
+  depot_admin: {
+    username: 'admin_chennai',
+    password: 'Admin@Depot2026',
+    role: 'depot_admin',
+    roleLabel: 'Central Depot Admin (12 Scheduled Buses)',
+    roleTitle: 'Depot Operations & Strategy'
+  },
+  driver: {
+    username: 'driver_ramesh',
+    password: 'Driver@2026',
+    role: 'driver',
+    roleLabel: 'Bus Driver (Assigned BUS-201 • Festival Express)',
+    roleTitle: 'Field Operations & Telematics'
+  }
+};
 
 function AdminLoginPage({ onLoginSuccess, onNavigate, theme, toggleTheme, apiBase, initialRole = 'depot_admin' }) {
   const [role, setRole] = useState(initialRole); // 'depot_admin' or 'driver'
@@ -30,14 +27,12 @@ function AdminLoginPage({ onLoginSuccess, onNavigate, theme, toggleTheme, apiBas
   const [error, setError] = useState(null);
   const [validationErrors, setValidationErrors] = useState({ username: '', password: '' });
   const [activeDemo, setActiveDemo] = useState(
-    import.meta.env.DEV && DEV_DEMO_ACCOUNTS ? (DEV_DEMO_ACCOUNTS[initialRole] || DEV_DEMO_ACCOUNTS.depot_admin) : null
+    DEV_DEMO_ACCOUNTS[initialRole] || DEV_DEMO_ACCOUNTS.depot_admin
   );
 
   // Keep active demo synced with selected role
   useEffect(() => {
-    if (import.meta.env.DEV && DEV_DEMO_ACCOUNTS) {
-      setActiveDemo(DEV_DEMO_ACCOUNTS[role] || DEV_DEMO_ACCOUNTS.depot_admin);
-    }
+    setActiveDemo(DEV_DEMO_ACCOUNTS[role] || DEV_DEMO_ACCOUNTS.depot_admin);
   }, [role]);
 
   // Sync initialRole if prop changes
@@ -136,7 +131,16 @@ function AdminLoginPage({ onLoginSuccess, onNavigate, theme, toggleTheme, apiBas
 
       if (!response.ok) {
         if (response.status === 401) {
-          setError(data.detail || 'Invalid User ID or password.');
+          if (data.detail && data.detail.toLowerCase().includes('role')) {
+            const currentTabName = role === 'depot_admin' ? 'Depot Operations (Admin)' : 'Field Operations (Driver)';
+            const oppositeRole = role === 'depot_admin' ? 'driver' : 'depot_admin';
+            const oppositeTabName = role === 'depot_admin' ? 'Field Operations & Telematics (Driver)' : 'Depot Operations & Strategy (Admin)';
+            setError(
+              `${data.detail}: Account '${trimmedUsername}' does not match the active ${currentTabName} tab. Please switch to the ${oppositeTabName} tab above.`
+            );
+          } else {
+            setError(data.detail || 'Invalid User ID or password.');
+          }
         } else if (response.status === 403) {
           setError(data.detail || `Access denied: Selected portal requires ${role === 'depot_admin' ? 'Depot Admin' : 'Driver'} privileges.`);
         } else if (response.status === 429) {
@@ -240,7 +244,7 @@ function AdminLoginPage({ onLoginSuccess, onNavigate, theme, toggleTheme, apiBas
               type="button"
               role="tab"
               aria-selected={!isDepot}
-              className={`role-tab-btn ${!isDepot ? 'active' : ''}`}
+              className={`role-tab-btn ${!isDepot ? 'active driver-active' : ''}`}
               onClick={() => handleRoleChange('driver')}
               id="tab-role-driver"
             >
@@ -260,15 +264,15 @@ function AdminLoginPage({ onLoginSuccess, onNavigate, theme, toggleTheme, apiBas
             </div>
           )}
 
-          {/* Demo Login Credentials Section (Development Only) */}
-          {import.meta.env.DEV && activeDemo && (
+          {/* Demo Login Credentials Section */}
+          {activeDemo && (
             <div className="demo-credentials-card" id="demo-credentials-section">
               <div className="demo-credentials-header">
                 <div className="demo-header-left">
                   <span className="demo-icon" aria-hidden="true">⚡</span>
                   <span className="demo-title">Demo Login Credentials</span>
                 </div>
-                <span className="demo-badge">DEV MODE ONLY</span>
+                <span className="demo-badge">OFFICIAL DEMO</span>
               </div>
               <div className="demo-credentials-details">
                 <div className="demo-field-row">
